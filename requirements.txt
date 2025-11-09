@@ -1,0 +1,27 @@
+# Core Framework
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+
+# LangChain & OpenAI
+langchain
+langchain-openai
+langchain-pinecone
+langchain-core
+
+# Pinecone
+pinecone-client
+
+# PDF Processing
+PyPDF2
+PyMuPDF
+
+# Image Processing (CLIP)
+transformers
+torch
+torchvision
+Pillow
+
+# Utilities
+pydantic
