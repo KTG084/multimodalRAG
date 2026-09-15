@@ -1,10 +1,8 @@
-# Core Framework
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
 python-multipart==0.0.32
 python-dotenv==1.2.3
 
-# LangChain & Gemini/Groq
 langchain==1.3.18
 langchain-google-genai==4.4.0
 langchain-groq==1.1.3
@@ -12,20 +10,14 @@ langchain-pinecone==0.2.13
 langchain-core==1.6.3
 langchain-text-splitters==1.1.2
 
-# Pinecone (langchain-pinecone already depends on the "pinecone" package;
-# the older "pinecone-client" package is deprecated and conflicts with it)
 pinecone==7.3.0
 
-# PDF Processing
 PyPDF2==3.0.1
 PyMuPDF==1.28.2
 
-# Image Processing
 Pillow==12.3.0
 pytesseract==0.3.13
 
-# HTTP client (file download + Next.js webhook callback)
 httpx==0.28.1
 
-# Utilities
 pydantic==2.13.4

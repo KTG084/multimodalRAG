@@ -2,8 +2,6 @@
 builder = "NIXPACKS"
 
 [deploy]
-# Procfile ("web: uvicorn main:app --host 0.0.0.0 --port $PORT") supplies
-# the start command; Nixpacks reads it automatically.
 healthcheckPath = "/health"
 healthcheckTimeout = 100
 restartPolicyType = "ON_FAILURE"

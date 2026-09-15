@@ -1,13 +1,5 @@
-"""
-RAG microservice.
-
-Stateless by design: this service owns Pinecone only. It has no user table,
-no session table, and no in-memory chat history — every request carries
-everything it needs (query, history, user/document scope), and a separate
-Next.js backend is the sole owner of persistent state (Postgres, auth,
-sessions). Only that Next.js backend is expected to call this service; the
-X-Internal-Key header is how it proves that.
-"""
+"""RAG microservice. Stateless — owns Pinecone only, no user/session tables.
+Called only by the Next.js backend, authenticated via X-Internal-Key."""
 
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -42,68 +34,38 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("rag_service")
 
-# google-genai logs a benign "use Chat.send_message_stream instead of AFC"
-# notice on every streamed call even though this app never uses tool/function
-# calling — it's just log noise, not a real warning about our usage.
 logging.getLogger("google_genai.models").setLevel(logging.ERROR)
-# Their per-request INFO logs (including multi-KB retry dumps) drown out ours.
 logging.getLogger("google_genai").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("groq").setLevel(logging.WARNING)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
-# Follow-up question rewrites: a one-sentence task, so the small model is enough.
 GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
-# Both defaults are reasoning models, and reasoning tokens count against max_tokens.
-# "low" measured ~0.7s to first token. Set empty for non-reasoning models, which
-# reject the parameter.
+# Empty string disables reasoning_effort for non-reasoning models, which reject it.
 GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "low")
 
-# Gemini stays for embeddings (Groq has no embedding models) and image descriptions.
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
 GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
-# Pinned to match the existing Pinecone index (created for 3072-dim OpenAI
-# embeddings) — gemini-embedding-001 supports 768/1536/3072 via Matryoshka
-# truncation, so 3072 avoids needing a new index.
+# Must match the dimension the Pinecone index was created with.
 GEMINI_EMBEDDING_DIMENSIONS = int(os.getenv("GEMINI_EMBEDDING_DIMENSIONS", "3072"))
 
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chaterbox-embedding-index")
 
-# Shared secret with the Next.js backend — proves a caller is the trusted
-# Next.js server, not end-user identity (Next.js already owns that).
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
-
-# Base URL of the Next.js app, used to report ingestion completion back
-# (e.g. http://localhost:3000). Optional: if unset, /ingest still works,
-# it just can't push a "document ready" webhook.
 NEXTJS_INTERNAL_URL = os.getenv("NEXTJS_INTERNAL_URL")
 
 MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
-# Groq's free tier limits tokens per minute, so long conversations would hit it
-# if the whole history were sent every time. Only the latest turns go to the model.
 MAX_HISTORY_TURNS = 10
 IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/jpg", "image/webp"}
 
-
-# ---------------------------------------------------------------------------
-# Auth — every route below is only ever called by the Next.js backend
-# ---------------------------------------------------------------------------
 
 async def verify_internal_key(x_internal_key: Optional[str] = Header(None)):
     if not INTERNAL_API_KEY or not hmac.compare_digest(x_internal_key or "", INTERNAL_API_KEY):
         raise HTTPException(401, "Invalid or missing internal API key")
 
-
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
 
 class IngestRequest(BaseModel):
     document_id: str
@@ -129,9 +91,7 @@ class QueryRequest(BaseModel):
     user_id: str
     history: List[HistoryTurn] = []
     document_ids: Optional[List[str]] = None  # None => search the user's whole library
-    # Next.js sets this only on the first message of a new session (it owns
-    # session state, so it's the one that knows) — mirrors ChatGPT auto-titling.
-    generate_title: bool = False
+    generate_title: bool = False  # true only on the first message of a session
 
 
 class DeleteResponse(BaseModel):
@@ -140,18 +100,13 @@ class DeleteResponse(BaseModel):
     deleted_count: int
 
 
-# ---------------------------------------------------------------------------
-# RAG service
-# ---------------------------------------------------------------------------
-
 def sse_event(event_type: str, data: dict) -> str:
     return f"data: {json.dumps({'type': event_type, **data})}\n\n"
 
 
 def extract_text(content) -> str:
-    """Newer Gemini models (with thinking enabled) return AIMessage.content as a
-    list of content blocks (text/signature/etc.) instead of a plain string —
-    pull just the text parts out, from either shape."""
+    """Gemini can return content as a list of blocks (text/signature/etc.)
+    instead of a plain string when thinking is enabled."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -166,7 +121,6 @@ def extract_text(content) -> str:
 
 
 def user_facing_error(e: Exception) -> str:
-    """Provider errors are large JSON blobs; the full detail is already logged."""
     text = str(e)
     if "429" in text or "RESOURCE_EXHAUSTED" in text or "rate_limit_exceeded" in text:
         return "The AI service's rate limit or daily quota was reached. Please try again later."
@@ -184,8 +138,6 @@ def require_groq_api_key() -> str:
 
 
 async def download_file(url: str) -> bytes:
-    """Streams the response and aborts as soon as the size limit is crossed,
-    instead of buffering an arbitrarily large body into memory first."""
     chunks: List[bytes] = []
     total = 0
 
@@ -204,11 +156,6 @@ async def download_file(url: str) -> bytes:
 async def notify_ingest_status(
     document_id: str, status: str, chunk_count: Optional[int] = None, error: Optional[str] = None
 ):
-    """Best-effort callback to Next.js so it can flip the document's status in Postgres.
-    Retries a few times with backoff so a momentary Next.js blip doesn't leave a
-    document stuck at "queued" forever, then logs loudly if it never gets through
-    (nothing else will surface that failure — Next.js's DB row is the only place
-    the outcome is supposed to land)."""
     if not NEXTJS_INTERNAL_URL:
         return
 
@@ -290,7 +237,6 @@ class RagService:
                 max_tokens=4096,
                 reasoning_effort=GROQ_REASONING_EFFORT or None,
                 streaming=True,
-                # One retry covers a blip; more would just delay a rate-limit error.
                 max_retries=2,
             )
         return self._llm
@@ -314,18 +260,13 @@ class RagService:
             self._vision_llm = ChatGoogleGenerativeAI(
                 model=GEMINI_VISION_MODEL,
                 google_api_key=GOOGLE_API_KEY,
-                # Gemini 3 thinking tokens count against max_output_tokens.
                 thinking_level="low",
                 max_output_tokens=4096,
-                # google-genai otherwise makes 5 attempts, retrying 429s too.
                 max_retries=2,
             )
         return self._vision_llm
 
-    # -- ingestion: images ---------------------------------------------------
-
     def preprocess_image(self, image_bytes: bytes) -> tuple[bytes, dict]:
-        """Preprocess image for optimal vision model performance"""
         try:
             image = Image.open(io.BytesIO(image_bytes))
 
@@ -362,7 +303,6 @@ class RagService:
             return image_bytes, {"error": str(e)}
 
     def describe_image_with_gemini(self, image_bytes: bytes, filename: str) -> tuple[str, dict]:
-        """Use Gemini to generate a detailed image description"""
         try:
             processed_bytes, img_metadata = self.preprocess_image(image_bytes)
             img_base64 = base64.b64encode(processed_bytes).decode("utf-8")
@@ -410,7 +350,6 @@ Be detailed and structured."""
             return f"Image: {filename} (description unavailable)", {}
 
     def extract_text_with_ocr_fallback(self, image_bytes: bytes) -> str:
-        """Fallback OCR extraction if the vision model's description is unusable"""
         try:
             image = Image.open(io.BytesIO(image_bytes))
             text = pytesseract.image_to_string(image)
@@ -420,7 +359,6 @@ Be detailed and structured."""
             return ""
 
     def process_image(self, image_bytes: bytes, filename: str) -> List[Document]:
-        """Process image with Gemini vision and OCR fallback into a single retrievable document"""
         try:
             description, metadata = self.describe_image_with_gemini(image_bytes, filename)
 
@@ -448,10 +386,7 @@ Be detailed and structured."""
         except Exception as e:
             raise ValueError(f"Error processing image {filename}: {str(e)}")
 
-    # -- ingestion: PDFs ------------------------------------------------------
-
     def extract_pages_from_pdf(self, pdf_stream: io.BytesIO) -> List[str]:
-        """Extract text per page from a PDF; index i holds page i+1's text."""
         try:
             pdf_reader = PyPDF2.PdfReader(pdf_stream)
             pages = [page.extract_text() or "" for page in pdf_reader.pages]
@@ -467,8 +402,6 @@ Be detailed and structured."""
             raise Exception(f"Error extracting PDF: {str(e)}")
 
     def process_pdf(self, pdf_stream: io.BytesIO, filename: str) -> List[Document]:
-        """Process PDF into chunks, keeping each chunk scoped to a single page so
-        sources can cite a page number."""
         pages = self.extract_pages_from_pdf(pdf_stream)
         if not any(page_text.strip() for page_text in pages):
             raise ValueError("No text extracted from PDF")
@@ -491,12 +424,9 @@ Be detailed and structured."""
                 )
         return documents
 
-    # -- retrieval + generation ------------------------------------------------
-
     def delete_document(self, document_id: str, user_id: str) -> int:
-        """Delete every vector belonging to a document. Works for both pod-based and
-        serverless Pinecone indexes by finding ids via a filtered query first, since
-        serverless indexes don't support index.delete(filter=...) directly."""
+        # Serverless Pinecone indexes don't support delete(filter=...), so
+        # find matching ids via a filtered query first.
         index = self.pinecone_index
         dimension = index.describe_index_stats().dimension
         zero_vector = [0.0] * dimension
@@ -514,7 +444,6 @@ Be detailed and structured."""
 
     @staticmethod
     def make_title(query: str, max_length: int = 50) -> str:
-        """The first question, whitespace-collapsed and cut at a word boundary."""
         title = " ".join(query.split())
         if len(title) <= max_length:
             return title or "New chat"
@@ -529,10 +458,7 @@ Be detailed and structured."""
         document_ids: Optional[List[str]],
         generate_title: bool = False,
     ):
-        """Yields Server-Sent Events: 'sources', an optional 'title' (first message
-        only), then 'token' events, then 'done' — or 'error' if anything in here
-        fails, so a mid-stream failure isn't just a silent dead stream."""
-
+        """Yields SSE events: sources, optional title, token(s), then done/error."""
         try:
             lc_history = [
                 HumanMessage(content=turn.content) if turn.role == "user" else AIMessage(content=turn.content)
@@ -706,9 +632,6 @@ if __name__ == "__main__":
     import uvicorn
 
     PORT = int(os.getenv("PORT", 8000))
-    # Auto-reload is for local dev only (set RELOAD=true) — in production
-    # (Railway starts this via the Procfile, not this block, but just in
-    # case) a restarting worker on every file touch is the wrong default.
     RELOAD = os.getenv("RELOAD", "false").lower() == "true"
     print(f"\nRAG service starting on http://0.0.0.0:{PORT}")
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=RELOAD)
