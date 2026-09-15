@@ -1,4 +1,4 @@
-"""RAG microservice. Stateless — owns Pinecone only, no user/session tables.
+"""RAG microservice. Stateless — owns Pinecone only, no user/session.
 Called only by the Next.js backend, authenticated via X-Internal-Key."""
 
 from datetime import datetime
