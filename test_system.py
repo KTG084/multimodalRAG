@@ -1,55 +1,71 @@
-import requests
 import json
+import os
+
+import requests
 
 BASE_URL = "http://localhost:8000"
+INTERNAL_KEY = os.getenv("INTERNAL_API_KEY", "change_me_to_a_random_secret")
+HEADERS = {"X-Internal-Key": INTERNAL_KEY}
+
+USER_ID = "test-user"
+DOCUMENT_ID = "test-doc-1"
+
 
 def test_complete_flow():
-    print("🧪 Testing complete RAG system...\n")
-    
-    # 1. Create session
-    print("1️⃣  Creating session...")
-    resp = requests.post(f"{BASE_URL}/session/create")
-    session_id = resp.json()["session_id"]
-    print(f"   ✅ Session: {session_id}\n")
-    
-    # 2. Upload PDF
-    print("2️⃣  Uploading PDF...")
-    with open("test.pdf", "rb") as f:
-        files = {"file": ("test.pdf", f, "application/pdf")}
-        resp = requests.post(f"{BASE_URL}/upload", files=files)
-        print(f"   ✅ {resp.json()}\n")
-    
-    # 3. Ask question
-    print("3️⃣  Asking question...")
+    print("Testing RAG service (called the way the Next.js backend would)...\n")
+
+    # This service ingests by URL, not multipart upload — point it at any
+    # publicly reachable PDF for a smoke test.
+    print("1. Ingesting a document by URL...")
     resp = requests.post(
-        f"{BASE_URL}/chat",
+        f"{BASE_URL}/ingest",
+        headers=HEADERS,
         json={
-            "question": "What is this document about?",
-            "session_id": session_id
-        }
+            "document_id": DOCUMENT_ID,
+            "user_id": USER_ID,
+            "file_url": "https://arxiv.org/pdf/1706.03762",
+            "filename": "attention-is-all-you-need.pdf",
+            "content_type": "application/pdf",
+        },
     )
-    result = resp.json()
-    print(f"   ✅ Answer: {result['answer']}\n")
-    
-    # 4. Follow-up question
-    print("4️⃣  Follow-up question...")
-    resp = requests.post(
-        f"{BASE_URL}/chat",
+    resp.raise_for_status()
+    print(f"   {resp.json()}\n")
+
+    print("2. Querying with streaming response...")
+    with requests.post(
+        f"{BASE_URL}/query",
+        headers=HEADERS,
         json={
-            "question": "Can you elaborate?",
-            "session_id": session_id
-        }
+            "query": "What is this document about?",
+            "user_id": USER_ID,
+            "history": [],
+            "document_ids": [DOCUMENT_ID],
+        },
+        stream=True,
+    ) as resp:
+        resp.raise_for_status()
+        answer = ""
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            event = json.loads(line[len("data: "):])
+            if event["type"] == "sources":
+                print(f"   sources: {event['sources']}\n")
+            elif event["type"] == "token":
+                answer += event["content"]
+            elif event["type"] == "done":
+                break
+        print(f"   answer: {answer}\n")
+
+    print("3. Deleting the document's vectors...")
+    resp = requests.delete(
+        f"{BASE_URL}/documents/{DOCUMENT_ID}", headers=HEADERS, params={"user_id": USER_ID}
     )
-    result = resp.json()
-    print(f"   ✅ Answer: {result['answer']}\n")
-    
-    # 5. Check history
-    print("5️⃣  Checking history...")
-    resp = requests.get(f"{BASE_URL}/session/{session_id}/history")
-    history = resp.json()
-    print(f"   ✅ Messages: {history['message_count']}\n")
-    
-    print("🎉 All tests passed!")
+    resp.raise_for_status()
+    print(f"   {resp.json()}\n")
+
+    print("All checks passed.")
+
 
 if __name__ == "__main__":
     test_complete_flow()
