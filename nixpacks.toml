@@ -1,6 +1,2 @@
-# Tells Railway's Nixpacks builder to apt-get install the Tesseract OCR
-# binary before installing Python deps. pytesseract (in requirements.txt)
-# is just a wrapper around this binary — without it, OCR fallback for
-# scanned/low-quality images silently fails.
 [phases.setup]
 aptPkgs = ["tesseract-ocr"]
