@@ -1,123 +1,256 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-from fastapi.middleware.cors import CORSMiddleware
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_pinecone import PineconeVectorStore
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_core.prompts import MessagesPlaceholder
-from langchain.chains.history_aware_retriever import create_history_aware_retriever
+"""
+RAG microservice.
+
+Stateless by design: this service owns Pinecone only. It has no user table,
+no session table, and no in-memory chat history — every request carries
+everything it needs (query, history, user/document scope), and a separate
+Next.js backend is the sole owner of persistent state (Postgres, auth,
+sessions). Only that Next.js backend is expected to call this service; the
+X-Internal-Key header is how it proves that.
+"""
 
 from datetime import datetime
-from pinecone import Pinecone as PineconeClient
-from dotenv import load_dotenv
-from openai import OpenAI
-from PIL import Image
+from typing import Dict, List, Optional
+import asyncio
+import hmac
+import io
+import json
+import logging
+import os
+
 import base64
 import fitz
+import httpx
 import PyPDF2
-import io
-import os
-from pydantic import BaseModel
-from typing import Optional, List, Dict
-import uuid
 import pytesseract
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_groq import ChatGroq
+from langchain_pinecone import PineconeVectorStore
+from PIL import Image
+from pinecone import Pinecone as PineconeClient
+from pydantic import BaseModel
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("rag_service")
 
-class UploadResponse(BaseModel):
-    status: str
-    message: str
-    doc_count: int
+# google-genai logs a benign "use Chat.send_message_stream instead of AFC"
+# notice on every streamed call even though this app never uses tool/function
+# calling — it's just log noise, not a real warning about our usage.
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
+# Their per-request INFO logs (including multi-KB retry dumps) drown out ours.
+logging.getLogger("google_genai").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("groq").setLevel(logging.WARNING)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
+# Follow-up question rewrites: a one-sentence task, so the small model is enough.
+GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
+# Both defaults are reasoning models, and reasoning tokens count against max_tokens.
+# "low" measured ~0.7s to first token. Set empty for non-reasoning models, which
+# reject the parameter.
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "low")
+
+# Gemini stays for embeddings (Groq has no embedding models) and image descriptions.
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GEMINI_VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
+GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001")
+# Pinned to match the existing Pinecone index (created for 3072-dim OpenAI
+# embeddings) — gemini-embedding-001 supports 768/1536/3072 via Matryoshka
+# truncation, so 3072 avoids needing a new index.
+GEMINI_EMBEDDING_DIMENSIONS = int(os.getenv("GEMINI_EMBEDDING_DIMENSIONS", "3072"))
+
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "chaterbox-embedding-index")
+
+# Shared secret with the Next.js backend — proves a caller is the trusted
+# Next.js server, not end-user identity (Next.js already owns that).
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+
+# Base URL of the Next.js app, used to report ingestion completion back
+# (e.g. http://localhost:3000). Optional: if unset, /ingest still works,
+# it just can't push a "document ready" webhook.
+NEXTJS_INTERNAL_URL = os.getenv("NEXTJS_INTERNAL_URL")
+
+MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+# Groq's free tier limits tokens per minute, so long conversations would hit it
+# if the whole history were sent every time. Only the latest turns go to the model.
+MAX_HISTORY_TURNS = 10
+IMAGE_CONTENT_TYPES = {"image/jpeg", "image/png", "image/jpg", "image/webp"}
+
+
+# ---------------------------------------------------------------------------
+# Auth — every route below is only ever called by the Next.js backend
+# ---------------------------------------------------------------------------
+
+async def verify_internal_key(x_internal_key: Optional[str] = Header(None)):
+    if not INTERNAL_API_KEY or not hmac.compare_digest(x_internal_key or "", INTERNAL_API_KEY):
+        raise HTTPException(401, "Invalid or missing internal API key")
+
+
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
+
+class IngestRequest(BaseModel):
+    document_id: str
+    user_id: str
+    file_url: str
     filename: str
-    description: Optional[str] = None
+    content_type: str
+
+
+class IngestResponse(BaseModel):
+    status: str
+    document_id: str
+    chunk_count: int
+
+
+class HistoryTurn(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
 
 
 class QueryRequest(BaseModel):
-    question: str
-    session_id: Optional[str] = None
+    query: str
+    user_id: str
+    history: List[HistoryTurn] = []
+    document_ids: Optional[List[str]] = None  # None => search the user's whole library
+    # Next.js sets this only on the first message of a new session (it owns
+    # session state, so it's the one that knows) — mirrors ChatGPT auto-titling.
+    generate_title: bool = False
 
 
-class ChatResponse(BaseModel):
-    answer: str
-    sources: List[Dict]
-    session_id: str
+class DeleteResponse(BaseModel):
+    status: str
+    document_id: str
+    deleted_count: int
 
 
-class QueryResponse(BaseModel):
-    answer: str
-    sources: List[Dict]
+# ---------------------------------------------------------------------------
+# RAG service
+# ---------------------------------------------------------------------------
+
+def sse_event(event_type: str, data: dict) -> str:
+    return f"data: {json.dumps({'type': event_type, **data})}\n\n"
 
 
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-    timestemp: Optional[str] = None
+def extract_text(content) -> str:
+    """Newer Gemini models (with thinking enabled) return AIMessage.content as a
+    list of content blocks (text/signature/etc.) instead of a plain string —
+    pull just the text parts out, from either shape."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "".join(parts)
+    return str(content) if content else ""
 
 
-class ChatHistoryManager:
-    """Manages chat sessions"""
-
-    def __init__(self):
-        self.sessions: Dict[str, Dict] = {}
-
-    def create_session(self) -> str:
-        """Create New Session"""
-        session_id = str(uuid.uuid4())
-        self.sessions[session_id] = {
-            "messages": [],
-            "created_at": datetime.now().isoformat(),
-            "last_activity": datetime.now().isoformat(),
-            "uploaded_files": [],
-        }
-        return session_id
-
-    def add_message(self, session_id: str, role: str, content: str, metadata: Dict = None):
-        """Add message to history"""
-        if session_id not in self.sessions:
-            self.create_session()
-
-        message = ChatMessage(
-            role=role, content=content, timestemp=datetime.now().isoformat()
-        )
-
-        self.sessions[session_id]["messages"].append(message)
-
-    def get_history(self, session_id: str) -> List[ChatMessage]:
-        """Get session history"""
-        return self.sessions.get(session_id, {}).get("messages", [])
-
-    def clear_session(self, session_id: str):
-        """Clear session"""
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-
-    def to_langchain_messages(self, session_id: str):
-        """Convert to LangChain format"""
-        from langchain_core.messages import HumanMessage, AIMessage
-
-        messages = []
-        history = self.get_history(session_id)
-
-        for msg in history:
-            if msg.role == "user":
-                messages.append(HumanMessage(content=msg.content))
-            else:
-                messages.append(AIMessage(content=msg.content))
-
-        return messages
+def user_facing_error(e: Exception) -> str:
+    """Provider errors are large JSON blobs; the full detail is already logged."""
+    text = str(e)
+    if "429" in text or "RESOURCE_EXHAUSTED" in text or "rate_limit_exceeded" in text:
+        return "The AI service's rate limit or daily quota was reached. Please try again later."
+    if "invalid_api_key" in text:
+        return "The AI service rejected its API key. Check the RAG service configuration."
+    if isinstance(e, ValueError):
+        return text
+    return "Something went wrong while processing your request. Please try again."
 
 
-class Chater:
+def require_groq_api_key() -> str:
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is not set on the RAG service.")
+    return GROQ_API_KEY
+
+
+async def download_file(url: str) -> bytes:
+    """Streams the response and aborts as soon as the size limit is crossed,
+    instead of buffering an arbitrarily large body into memory first."""
+    chunks: List[bytes] = []
+    total = 0
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise ValueError(f"File exceeds {MAX_DOWNLOAD_BYTES} byte limit")
+                chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
+async def notify_ingest_status(
+    document_id: str, status: str, chunk_count: Optional[int] = None, error: Optional[str] = None
+):
+    """Best-effort callback to Next.js so it can flip the document's status in Postgres.
+    Retries a few times with backoff so a momentary Next.js blip doesn't leave a
+    document stuck at "queued" forever, then logs loudly if it never gets through
+    (nothing else will surface that failure — Next.js's DB row is the only place
+    the outcome is supposed to land)."""
+    if not NEXTJS_INTERNAL_URL:
+        return
+
+    payload: Dict = {"status": status}
+    if chunk_count is not None:
+        payload["chunk_count"] = chunk_count
+    if error is not None:
+        payload["error"] = error
+
+    url = f"{NEXTJS_INTERNAL_URL}/api/internal/documents/{document_id}/status"
+    headers = {"X-Internal-Key": INTERNAL_API_KEY or ""}
+    attempts = 3
+
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+            return
+        except httpx.HTTPError as e:
+            logger.warning(
+                "Ingest-status callback attempt %d/%d failed for document %s: %s",
+                attempt, attempts, document_id, e,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(2 ** (attempt - 1))
+
+    logger.error(
+        "Ingest-status callback permanently failed for document %s after %d attempts - "
+        "Next.js will never see this '%s' status unless it polls separately.",
+        document_id, attempts, status,
+    )
+
+
+class RagService:
     def __init__(self):
         self._embeddings = None
         self._vectorStore = None
         self._llm = None
-        self._vision_client = None
-        self.chat_history_manager = ChatHistoryManager()
+        self._fast_llm = None
+        self._vision_llm = None
+        self._pinecone_index = None
         self._text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", ". ", " ", ""]
         )
@@ -125,38 +258,71 @@ class Chater:
     @property
     def embeddings(self):
         if self._embeddings is None:
-            self._embeddings = OpenAIEmbeddings(
-                model="text-embedding-3-large",
-                openai_api_key=os.getenv("OPENAI_API_KEY"),
+            self._embeddings = GoogleGenerativeAIEmbeddings(
+                model=GEMINI_EMBEDDING_MODEL,
+                google_api_key=GOOGLE_API_KEY,
+                output_dimensionality=GEMINI_EMBEDDING_DIMENSIONS,
             )
         return self._embeddings
 
     @property
     def vectorStore(self):
         if self._vectorStore is None:
-            pc = PineconeClient(api_key=os.getenv("PINECONE_API_KEY"))
-            index_name = "chaterbox-embedding-index"
             self._vectorStore = PineconeVectorStore(
-                index_name=index_name, embedding=self.embeddings
+                index_name=PINECONE_INDEX_NAME, embedding=self.embeddings
             )
         return self._vectorStore
 
     @property
+    def pinecone_index(self):
+        if self._pinecone_index is None:
+            pc = PineconeClient(api_key=PINECONE_API_KEY)
+            self._pinecone_index = pc.Index(PINECONE_INDEX_NAME)
+        return self._pinecone_index
+
+    @property
     def llm(self):
         if self._llm is None:
-            self._llm = ChatOpenAI(
+            self._llm = ChatGroq(
+                model_name=GROQ_CHAT_MODEL,
+                groq_api_key=require_groq_api_key(),
                 temperature=0.5,
-                model="gpt-4o",
-                openai_api_key=os.getenv("OPENAI_API_KEY"),
+                max_tokens=4096,
+                reasoning_effort=GROQ_REASONING_EFFORT or None,
+                streaming=True,
+                # One retry covers a blip; more would just delay a rate-limit error.
+                max_retries=2,
             )
         return self._llm
 
     @property
-    def vision_client(self):
-        """Separate client for vision tasks"""
-        if self._vision_client is None:
-            self._vision_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        return self._vision_client
+    def fast_llm(self):
+        if self._fast_llm is None:
+            self._fast_llm = ChatGroq(
+                model_name=GROQ_FAST_MODEL,
+                groq_api_key=require_groq_api_key(),
+                temperature=0,
+                max_tokens=256,
+                reasoning_effort=GROQ_REASONING_EFFORT or None,
+                max_retries=2,
+            )
+        return self._fast_llm
+
+    @property
+    def vision_llm(self):
+        if self._vision_llm is None:
+            self._vision_llm = ChatGoogleGenerativeAI(
+                model=GEMINI_VISION_MODEL,
+                google_api_key=GOOGLE_API_KEY,
+                # Gemini 3 thinking tokens count against max_output_tokens.
+                thinking_level="low",
+                max_output_tokens=4096,
+                # google-genai otherwise makes 5 attempts, retrying 429s too.
+                max_retries=2,
+            )
+        return self._vision_llm
+
+    # -- ingestion: images ---------------------------------------------------
 
     def preprocess_image(self, image_bytes: bytes) -> tuple[bytes, dict]:
         """Preprocess image for optimal vision model performance"""
@@ -170,12 +336,10 @@ class Chater:
             }
 
             if image.mode in ("RGBA", "LA", "P"):
-                background = Image.new("RGBA", image.size, (255, 255, 255))
-                if image.mode == "P":
-                    image = image.convert("RGBA")
-                background.paste(
-                    image, mask=image.split()[-1] if image.mode == "RGBA" else None
-                )
+                # JPEG has no alpha channel: flatten onto an RGB white background.
+                image = image.convert("RGBA")
+                background = Image.new("RGB", image.size, (255, 255, 255))
+                background.paste(image, mask=image.split()[-1])
                 image = background
             elif image.mode != "RGB":
                 image = image.convert("RGB")
@@ -194,10 +358,11 @@ class Chater:
 
             return processed_bytes, metadata
         except Exception as e:
+            logger.warning("Image preprocessing failed, using original bytes: %s", e)
             return image_bytes, {"error": str(e)}
 
-    def describe_image_with_gpt4v(self, image_bytes: bytes, filename: str) -> str:
-        """Use GPT-4v to generate detailed image description"""
+    def describe_image_with_gemini(self, image_bytes: bytes, filename: str) -> tuple[str, dict]:
+        """Use Gemini to generate a detailed image description"""
         try:
             processed_bytes, img_metadata = self.preprocess_image(image_bytes)
             img_base64 = base64.b64encode(processed_bytes).decode("utf-8")
@@ -215,67 +380,54 @@ Analyze this image comprehensively and provide:
 
 Be detailed and structured."""
 
-            response = self.vision_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
+            response = self.vision_llm.invoke(
+                [
+                    HumanMessage(
+                        content=[
                             {"type": "text", "text": enhanced_prompt},
                             {
                                 "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{img_base64}",
-                                    "detail": "high",
-                                },
+                                "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"},
                             },
-                        ],
-                    }
-                ],
-                max_tokens=1000,
-                temperature=0.2,
+                        ]
+                    )
+                ]
             )
 
-            description = response.choices[0].message.content
+            description = extract_text(response.content)
+            usage = getattr(response, "usage_metadata", None) or {}
             metadata = {
                 "filename": filename,
-                "model": "gpt-4o",
-                "tokens_used": response.usage.total_tokens,
+                "model": GEMINI_VISION_MODEL,
+                "tokens_used": usage.get("total_tokens", 0),
                 "image_metadata": img_metadata,
                 "timestamp": datetime.now().isoformat(),
             }
 
             return description, metadata
         except Exception:
+            logger.exception("Gemini vision description failed for %s", filename)
             return f"Image: {filename} (description unavailable)", {}
 
     def extract_text_with_ocr_fallback(self, image_bytes: bytes) -> str:
-        """Fallback OCR extraction if GPT-4v fails"""
+        """Fallback OCR extraction if the vision model's description is unusable"""
         try:
             image = Image.open(io.BytesIO(image_bytes))
             text = pytesseract.image_to_string(image)
             return text.strip()
-        except Exception:
+        except Exception as e:
+            logger.warning("OCR fallback failed: %s", e)
             return ""
 
-    def process_image(self, image_bytes: bytes, filename: str) -> list:
-        """Process image with GPT-4V and OCR fallback"""
+    def process_image(self, image_bytes: bytes, filename: str) -> List[Document]:
+        """Process image with Gemini vision and OCR fallback into a single retrievable document"""
         try:
-            description, metadata = self.describe_image_with_gpt4v(image_bytes, filename)
+            description, metadata = self.describe_image_with_gemini(image_bytes, filename)
 
             if len(description) < 100 or "unable to view" in description.lower():
                 ocr_text = self.extract_text_with_ocr_fallback(image_bytes)
                 if ocr_text:
                     description += f"\n\n[OCR Extracted Text]:\n{ocr_text}"
-
-            image = Image.open(io.BytesIO(image_bytes))
-            if max(image.size) > 512:
-                image.thumbnail((512, 512), Image.Resampling.LANCZOS)
-                thumb_buffer = io.BytesIO()
-                image.save(thumb_buffer, format="JPEG", quality=85)
-                img_base64 = base64.b64encode(thumb_buffer.getvalue()).decode("utf-8")
-            else:
-                img_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
             document = Document(
                 page_content=description,
@@ -284,172 +436,205 @@ Be detailed and structured."""
                     "type": "image",
                     "content_preview": description[:200],
                     "timestamp": datetime.now().isoformat(),
-                    # Flatten metadata - Pinecone compatible
-                    "model": metadata.get("model", "gpt-4o"),
+                    "model": metadata.get("model", GEMINI_VISION_MODEL),
                     "tokens_used": metadata.get("tokens_used", 0),
                     "image_format": str(metadata.get("image_metadata", {}).get("format", "unknown")),
                     "image_mode": str(metadata.get("image_metadata", {}).get("mode", "unknown")),
                     "description_length": len(description),
-                }
+                },
             )
 
-            return [document], description
+            return [document]
         except Exception as e:
             raise ValueError(f"Error processing image {filename}: {str(e)}")
 
-    def extract_text_from_pdf(self, pdf_stream: io.BytesIO) -> str:
-        """Extract text from PDF"""
-        text = ""
+    # -- ingestion: PDFs ------------------------------------------------------
+
+    def extract_pages_from_pdf(self, pdf_stream: io.BytesIO) -> List[str]:
+        """Extract text per page from a PDF; index i holds page i+1's text."""
         try:
             pdf_reader = PyPDF2.PdfReader(pdf_stream)
-            for page in pdf_reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n\n"
+            pages = [page.extract_text() or "" for page in pdf_reader.pages]
 
-            if not text.strip():
+            if not any(page_text.strip() for page_text in pages):
                 pdf_stream.seek(0)
                 pdf_document = fitz.open(stream=pdf_stream, filetype="pdf")
-                for page_num in range(pdf_document.page_count):
-                    page = pdf_document[page_num]
-                    text += page.get_text() + "\n\n"
+                pages = [pdf_document[i].get_text() for i in range(pdf_document.page_count)]
                 pdf_document.close()
 
-            return text.strip()
+            return pages
         except Exception as e:
             raise Exception(f"Error extracting PDF: {str(e)}")
 
-    def process_pdf(self, pdf_stream: io.BytesIO, filename: str) -> list:
-        """Process PDF into chunks"""
-        text = self.extract_text_from_pdf(pdf_stream)
-        if not text:
+    def process_pdf(self, pdf_stream: io.BytesIO, filename: str) -> List[Document]:
+        """Process PDF into chunks, keeping each chunk scoped to a single page so
+        sources can cite a page number."""
+        pages = self.extract_pages_from_pdf(pdf_stream)
+        if not any(page_text.strip() for page_text in pages):
             raise ValueError("No text extracted from PDF")
 
-        chunks = self._text_splitter.split_text(text)
-        documents = [
-            Document(
-                page_content=chunk,
-                metadata={
-                    "source": filename,
-                    "type": "pdf",
-                    "chunk_index": i,
-                    "total_chunks": len(chunks),
-                },
-            )
-            for i, chunk in enumerate(chunks)
-        ]
+        documents = []
+        for page_num, page_text in enumerate(pages):
+            if not page_text.strip():
+                continue
+            for i, chunk in enumerate(self._text_splitter.split_text(page_text)):
+                documents.append(
+                    Document(
+                        page_content=chunk,
+                        metadata={
+                            "source": filename,
+                            "type": "pdf",
+                            "page": page_num + 1,
+                            "chunk_index": i,
+                        },
+                    )
+                )
         return documents
 
-    def query_rag(self, question: str) -> dict:
-        retriever = self.vectorStore.as_retriever(search_kwargs={"k": 5})
+    # -- retrieval + generation ------------------------------------------------
 
-        system_prompt = """You are a helpful AI assistant. Use the following context to answer the question.
-If you don't know the answer based on the context, say so.
+    def delete_document(self, document_id: str, user_id: str) -> int:
+        """Delete every vector belonging to a document. Works for both pod-based and
+        serverless Pinecone indexes by finding ids via a filtered query first, since
+        serverless indexes don't support index.delete(filter=...) directly."""
+        index = self.pinecone_index
+        dimension = index.describe_index_stats().dimension
+        zero_vector = [0.0] * dimension
 
-Context: {context}"""
-
-        prompt = ChatPromptTemplate.from_messages(
-            [("system", system_prompt), ("human", "{input}")]
+        results = index.query(
+            vector=zero_vector,
+            filter={"document_id": document_id, "user_id": user_id},
+            top_k=10000,
+            include_values=False,
         )
+        ids = [match.id for match in results.matches]
+        if ids:
+            index.delete(ids=ids)
+        return len(ids)
 
-        question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
-        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
-        result = rag_chain.invoke({"input": question})
+    @staticmethod
+    def make_title(query: str, max_length: int = 50) -> str:
+        """The first question, whitespace-collapsed and cut at a word boundary."""
+        title = " ".join(query.split())
+        if len(title) <= max_length:
+            return title or "New chat"
+        cut = title[:max_length].rsplit(" ", 1)[0] or title[:max_length]
+        return cut.rstrip(" ,.;:-") + "..."
 
-        sources = []
-        if "context" in result:
-            for doc in result["context"]:
-                sources.append(
-                    {
-                        "content": doc.page_content[:200],
-                        "source": doc.metadata.get("source", "unknown"),
-                        "type": doc.metadata.get("type", "unknown"),
-                    }
-                )
+    async def stream_query(
+        self,
+        query: str,
+        user_id: str,
+        history: List[HistoryTurn],
+        document_ids: Optional[List[str]],
+        generate_title: bool = False,
+    ):
+        """Yields Server-Sent Events: 'sources', an optional 'title' (first message
+        only), then 'token' events, then 'done' — or 'error' if anything in here
+        fails, so a mid-stream failure isn't just a silent dead stream."""
 
-        return {"answer": result["answer"], "sources": sources}
-
-    def create_rag_chain_with_history(self):
-        """Create history-aware RAG Chain"""
-        contextualize_q_prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "Given chat history and new question, reformulate as standalone question.",
-                ),
-                MessagesPlaceholder("chat_history"),
-                ("human", "{input}"),
+        try:
+            lc_history = [
+                HumanMessage(content=turn.content) if turn.role == "user" else AIMessage(content=turn.content)
+                for turn in history[-MAX_HISTORY_TURNS:]
             ]
-        )
 
-        history_aware_retriever = create_history_aware_retriever(
-            self.llm,
-            self.vectorStore.as_retriever(search_kwargs={"k": 5}),
-            contextualize_q_prompt,
-        )
+            # An empty (but non-None) document_ids means "this chat has no ready
+            # documents yet" — that must return no context, not fall through to
+            # searching the user's whole library across every other chat.
+            if document_ids is not None and len(document_ids) == 0:
+                docs = []
+            else:
+                filter_: Dict = {"user_id": user_id}
+                if document_ids:
+                    filter_["document_id"] = {"$in": document_ids}
 
-        qa_prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", "Use context to answer. Be concise.\n\nContext: {context}"),
-                MessagesPlaceholder("chat_history"),
-                ("human", "{input}"),
-            ]
-        )
+                retriever = self.vectorStore.as_retriever(search_kwargs={"k": 5, "filter": filter_})
 
-        question_answer_chain = create_stuff_documents_chain(self.llm, qa_prompt)
-        rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
-        return rag_chain
+                search_query = query
+                if lc_history:
+                    contextualize_prompt = ChatPromptTemplate.from_messages(
+                        [
+                            (
+                                "system",
+                                "Given the chat history and a follow-up question, rephrase the "
+                                "follow-up as a standalone question. Return only the question.",
+                            ),
+                            MessagesPlaceholder("chat_history"),
+                            ("human", "{input}"),
+                        ]
+                    )
+                    rewritten = await (contextualize_prompt | self.fast_llm).ainvoke(
+                        {"input": query, "chat_history": lc_history}
+                    )
+                    # Must be a plain str: LangChain's text parsers return a str subclass
+                    # (TextAccessor) that the Gemini embeddings API rejects with a 500.
+                    search_query = str(extract_text(rewritten.content)).strip() or query
 
-    def query_with_history(self, question: str, session_id: str) -> dict:
-        """Query with chat history"""
-        lc_history = self.chat_history_manager.to_langchain_messages(session_id)
-        rag_chain = self.create_rag_chain_with_history()
+                docs = await retriever.ainvoke(search_query)
 
-        result = rag_chain.invoke({"input": question, "chat_history": lc_history})
-        self.chat_history_manager.add_message(session_id, "user", question)
-        self.chat_history_manager.add_message(session_id, "assistant", result["answer"])
-
-        sources = []
-        if "context" in result:
-            for doc in result["context"]:
-                source_info = {
+            sources = [
+                {
                     "content": doc.page_content[:300],
                     "source": doc.metadata.get("source", "unknown"),
+                    "type": doc.metadata.get("type", "unknown"),
+                    "document_id": doc.metadata.get("document_id"),
+                    # Pinecone returns stored numbers as floats (5.0)
+                    "page": int(doc.metadata["page"]) if doc.metadata.get("page") is not None else None,
                 }
+                for doc in docs
+            ]
+            yield sse_event("sources", {"sources": sources})
 
-                if doc.metadata.get("type") == "image" and "image_thumbnail" in doc.metadata:
-                    source_info["has_image"] = True
-                    source_info["content_preview"] = doc.metadata.get(
-                        "content_preview", ""
-                    )
+            if generate_title:
+                yield sse_event("title", {"title": self.make_title(query)})
 
-                sources.append(source_info)
+            qa_prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        "You are a helpful, knowledgeable assistant. If document context is "
+                        "given below, use it to answer when it's relevant and prefer it over "
+                        "your own knowledge if the two conflict. If the context doesn't contain "
+                        "the answer — or none is given, because this chat has no documents — "
+                        "answer normally from your own knowledge instead. Never refuse just "
+                        "because nothing was retrieved.\n\n"
+                        "Context:\n{context}",
+                    ),
+                    MessagesPlaceholder("chat_history"),
+                    ("human", "{input}"),
+                ]
+            )
+            chain = qa_prompt | self.llm
+            context_text = "\n\n".join(doc.page_content for doc in docs)
 
-        return {"answer": result["answer"], "sources": sources}
+            async for chunk in chain.astream(
+                {"input": query, "chat_history": lc_history, "context": context_text}
+            ):
+                text = extract_text(chunk.content)
+                if text:
+                    yield sse_event("token", {"content": text})
+
+            yield sse_event("done", {})
+        except Exception as e:
+            logger.exception("stream_query failed for user %s", user_id)
+            yield sse_event("error", {"message": user_facing_error(e)})
 
 
-chater = Chater()
+rag_service = RagService()
 
 app = FastAPI(
-    title="ChatBOT",
-    version="1.0",
-    description="Advanced Chatbot",
+    title="RAG Service",
+    version="2.0",
+    description="Stateless multimodal retrieval/ingestion microservice — called only by the Next.js backend.",
     docs_url="/docs",
     redoc_url="/redoc",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
 )
 
 
 @app.get("/")
 async def root():
-    return {"message": "RAG System is running"}
+    return {"message": "RAG service is running"}
 
 
 @app.get("/health")
@@ -457,110 +642,73 @@ async def health():
     return {"status": "healthy"}
 
 
-@app.post("/session/create")
-async def create_session():
-    session_id = chater.chat_history_manager.create_session()
-    return {"session_id": session_id}
-
-
-@app.get("/session/{session_id}/history")
-async def get_history(session_id: str):
-    history = chater.chat_history_manager.get_history(session_id)
-    return {"session_id": session_id, "history": history}
-
-
-@app.delete("/session/{session_id}")
-async def clear_session(session_id: str):
-    chater.chat_history_manager.clear_session(session_id)
-    return {"message": "Session cleared", "session_id": session_id}
-
-
-@app.post("/upload", response_model=UploadResponse)
-async def upload_pdf_or_image(file: UploadFile = File(...)):
+@app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(verify_internal_key)])
+async def ingest(request: IngestRequest):
     try:
-        content = await file.read()
-        file_type = file.content_type
-        description = None
+        content = await download_file(request.file_url)
 
-        if file_type == "application/pdf":
-            pdf_stream = io.BytesIO(content)
-            documents = chater.process_pdf(pdf_stream, file.filename)
-        elif file_type in ["image/jpeg", "image/png", "image/jpg", "image/webp"]:
-            documents, description = chater.process_image(content, file.filename)
+        if request.content_type == "application/pdf":
+            documents = await asyncio.to_thread(
+                rag_service.process_pdf, io.BytesIO(content), request.filename
+            )
+        elif request.content_type in IMAGE_CONTENT_TYPES:
+            documents = await asyncio.to_thread(
+                rag_service.process_image, content, request.filename
+            )
         else:
-            raise HTTPException(400, f"Unsupported file: {file.content_type}")
+            raise HTTPException(400, f"Unsupported content type: {request.content_type}")
 
-        chater.vectorStore.add_documents(documents)
+        for document in documents:
+            document.metadata["user_id"] = request.user_id
+            document.metadata["document_id"] = request.document_id
 
-        return UploadResponse(
-            status="success",
-            message=f"Processed {file.filename}",
-            doc_count=len(documents),
-            filename=file.filename,
-            description=description[:500] if description else None,
+        await asyncio.to_thread(rag_service.vectorStore.add_documents, documents)
+
+        logger.info(
+            "Ingested document %s (%d chunks) for user %s",
+            request.document_id, len(documents), request.user_id,
         )
+        await notify_ingest_status(request.document_id, "ready", chunk_count=len(documents))
+        return IngestResponse(status="ready", document_id=request.document_id, chunk_count=len(documents))
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(500, str(e))
+        logger.exception("Ingestion failed for document %s", request.document_id)
+        message = user_facing_error(e)
+        await notify_ingest_status(request.document_id, "failed", error=message)
+        raise HTTPException(500, message)
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: QueryRequest):
-    try:
-        if not request.session_id:
-            request.session_id = chater.chat_history_manager.create_session()
-
-        result = chater.query_with_history(request.question, request.session_id)
-        return ChatResponse(
-            answer=result["answer"],
-            sources=result["sources"],
-            session_id=request.session_id,
-        )
-    except Exception as e:
-        raise HTTPException(500, str(e))
+@app.post("/query", dependencies=[Depends(verify_internal_key)])
+async def query(request: QueryRequest):
+    return StreamingResponse(
+        rag_service.stream_query(
+            request.query,
+            request.user_id,
+            request.history,
+            request.document_ids,
+            request.generate_title,
+        ),
+        media_type="text/event-stream",
+    )
 
 
-@app.post("/ask")
-async def ask(file: Optional[UploadFile] = File(None), question: Optional[str] = Form(None)):
-    try:
-        if not file and not question:
-            raise HTTPException(400, "Provide file or question")
-
-        session_id = chater.chat_history_manager.create_session()
-
-        if file:
-            content = await file.read()
-            file_type = file.content_type
-
-            if file_type == "application/pdf":
-                pdf_stream = io.BytesIO(content)
-                documents = chater.process_pdf(pdf_stream, file.filename)
-            elif file_type in ["image/jpeg", "image/png", "image/jpg", "image/webp"]:
-                documents, description = chater.process_image(content, file.filename)
-            else:
-                raise HTTPException(400, f"Unsupported file: {file.content_type}")
-
-            chater.vectorStore.add_documents(documents)
-
-        if question:
-            result = chater.query_with_history(question, session_id)
-            return {
-                "answer": result["answer"],
-                "sources": result["sources"],
-                "session_id": session_id,
-            }
-
-        return {"message": "File uploaded", "session_id": session_id}
-
-    except Exception as e:
-        raise HTTPException(500, str(e))
+@app.delete(
+    "/documents/{document_id}", response_model=DeleteResponse, dependencies=[Depends(verify_internal_key)]
+)
+async def delete_document(document_id: str, user_id: str):
+    deleted_count = rag_service.delete_document(document_id, user_id)
+    return DeleteResponse(status="deleted", document_id=document_id, deleted_count=deleted_count)
 
 
 if __name__ == "__main__":
     import uvicorn
 
     PORT = int(os.getenv("PORT", 8000))
-    print(f"\nServer starting on http://0.0.0.0:{PORT}")
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=True)
+    # Auto-reload is for local dev only (set RELOAD=true) — in production
+    # (Railway starts this via the Procfile, not this block, but just in
+    # case) a restarting worker on every file touch is the wrong default.
+    RELOAD = os.getenv("RELOAD", "false").lower() == "true"
+    print(f"\nRAG service starting on http://0.0.0.0:{PORT}")
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, reload=RELOAD)
